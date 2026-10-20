@@ -65,6 +65,18 @@ func TestClient_Default(t *testing.T) {
 	}
 }
 
+func TestConfigFromSpec_BaseURL(t *testing.T) {
+	const want = "https://gateway.example.com/tenant"
+	cfg := model.ConfigFromSpec(&v1alpha1.ModelSpec{
+		Provider: "google",
+		Model:    "gemini-3.1-flash-lite",
+		BaseUrl:  want,
+	})
+	if cfg.BaseURL != want {
+		t.Errorf("expected BaseURL %q, got %q", want, cfg.BaseURL)
+	}
+}
+
 func TestClient_FromConfig(t *testing.T) {
 	cfg := model.Config{
 		Provider: "google",
@@ -130,8 +142,8 @@ func TestClient_GeminiHTTP(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if !r.URL.Query().Has("key") {
-			t.Errorf("expected key in query params")
+		if r.Header.Get("x-goog-api-key") == "" {
+			t.Errorf("expected x-goog-api-key header")
 		}
 
 		w.Header().Set("Content-Type", "application/json")

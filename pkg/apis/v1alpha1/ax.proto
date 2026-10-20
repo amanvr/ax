@@ -194,6 +194,9 @@ message ModelSpec {
   // parameters are provider-specific generation settings passed through to the
   // model API as-is, for example temperature or maxOutputTokens for Gemini.
   google.protobuf.Struct parameters = 4;
+  // base_url overrides the Gemini API base URL, for example a gateway endpoint.
+  // When empty the default https://generativelanguage.googleapis.com is used.
+  string base_url = 5;
 }
 
 message SecretKeyRef {

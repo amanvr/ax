@@ -91,6 +91,7 @@ func ConfigFromSpec(spec *v1alpha1.ModelSpec) Config {
 		Model:      spec.Model,
 		Parameters: spec.GetParameters().AsMap(),
 		SecretKey:  secKey,
+		BaseURL:    spec.GetBaseUrl(),
 	}
 }
 
@@ -506,7 +507,7 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 		baseURL = "https://generativelanguage.googleapis.com"
 	}
 
-	endpoint := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", baseURL, req.Model, c.cfg.APIKey)
+	endpoint := fmt.Sprintf("%s/v1beta/models/%s:generateContent", baseURL, req.Model)
 
 	payload := map[string]interface{}{
 		"contents": []map[string]interface{}{
@@ -553,6 +554,7 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 		return nil, fmt.Errorf("creating http request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", c.cfg.APIKey)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {

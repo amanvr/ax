@@ -41,6 +41,9 @@ import (
 const (
 	geminiSecretName = "gemini-api-secret"
 	geminiSecretKey  = "GEMINI_API_KEY"
+	// geminiBaseURLKey is the secret key and container env var that overrides the
+	// Gemini API base URL for the Antigravity agent, for example a gateway endpoint.
+	geminiBaseURLKey = "GOOGLE_GEMINI_BASE_URL"
 	// secretLookupTimeout bounds the Kubernetes secret lookup so a slow or
 	// unreachable cluster cannot stall reconciliation.
 	secretLookupTimeout = 2 * time.Second
@@ -157,6 +160,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
 		extraEnv[geminiSecretKey] = geminiKey
+	}
+
+	if baseURL := r.lookupGeminiBaseURL(ctx, atespace); baseURL != "" {
+		extraEnv[geminiBaseURLKey] = baseURL
 	}
 
 	// Only launch configuration belongs in the template; status changes
@@ -377,6 +384,25 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 	if key := os.Getenv(geminiSecretKey); key != "" {
 		slog.Info("resolved GEMINI_API_KEY from server environment for actor template")
 		return key
+	}
+	return ""
+}
+
+// lookupGeminiBaseURL resolves the Gemini API base URL override for the task container,
+// preferring the Kubernetes secret in the task's atespace and falling back to the server's
+// own environment. It returns "" when neither source has a value, leaving the default endpoint.
+func (r *TaskReconciler) lookupGeminiBaseURL(ctx context.Context, atespace string) string {
+	if r.SecretResolver != nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
+		defer cancel()
+		if url, err := r.SecretResolver(lookupCtx, atespace, geminiSecretName, geminiBaseURLKey); err == nil && url != "" {
+			slog.Info("resolved GOOGLE_GEMINI_BASE_URL from kubernetes secret for actor template", "atespace", atespace)
+			return url
+		}
+	}
+	if url := os.Getenv(geminiBaseURLKey); url != "" {
+		slog.Info("resolved GOOGLE_GEMINI_BASE_URL from server environment for actor template")
+		return url
 	}
 	return ""
 }
