@@ -142,8 +142,8 @@ func TestClient_GeminiHTTP(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if r.Header.Get("x-goog-api-key") == "" {
-			t.Errorf("expected x-goog-api-key header")
+		if r.Header.Get("Authorization") == "" {
+			t.Errorf("expected Authorization header")
 		}
 
 		w.Header().Set("Content-Type", "application/json")

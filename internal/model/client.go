@@ -554,7 +554,7 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 		return nil, fmt.Errorf("creating http request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-goog-api-key", c.cfg.APIKey)
+	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
