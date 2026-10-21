@@ -38,6 +38,7 @@ import (
 // Supported providers and default models
 const (
 	ProviderGoogle = "google"
+	ProviderOpenAI = "openai"
 
 	DefaultModel             = "gemini-3.8-flash"
 	DefaultModelResourceName = "default-model"
@@ -488,6 +489,9 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	if provider == "" || provider == ProviderGoogle {
 		return c.generateGoogle(ctx, effectiveReq)
 	}
+	if provider == ProviderOpenAI {
+		return c.generateOpenAI(ctx, effectiveReq)
+	}
 
 	if c.cfg.DisableRemote {
 		return c.fallbackResponse(effectiveReq), nil
@@ -603,6 +607,102 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 			PromptTokens:     geminiResp.UsageMetadata.PromptTokenCount,
 			CompletionTokens: geminiResp.UsageMetadata.CandidatesTokenCount,
 			TotalTokens:      geminiResp.UsageMetadata.TotalTokenCount,
+		},
+	}, nil
+}
+
+// generateOpenAI communicates with an OpenAI-compatible chat completions API.
+func (c *Client) generateOpenAI(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	if c.cfg.DisableRemote || c.cfg.APIKey == "" {
+		return c.fallbackResponse(req), nil
+	}
+
+	baseURL := c.cfg.BaseURL
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
+	}
+
+	endpoint := fmt.Sprintf("%s/chat/completions", baseURL)
+
+	messages := []map[string]string{}
+	if req.SystemInstruction != "" {
+		messages = append(messages, map[string]string{"role": "system", "content": req.SystemInstruction})
+	}
+	messages = append(messages, map[string]string{"role": "user", "content": req.Prompt})
+
+	payload := map[string]interface{}{
+		"model":    req.Model,
+		"messages": messages,
+	}
+
+	// Configured parameters go through as-is; per-request values override them.
+	for k, v := range c.cfg.Parameters {
+		if k != systemInstructionParam {
+			payload[k] = v
+		}
+	}
+	if req.Temperature > 0 {
+		payload["temperature"] = req.Temperature
+	}
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
+	}
+
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("creating http request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return c.fallbackResponse(req), nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return c.fallbackResponse(req), nil
+		}
+		return nil, fmt.Errorf("openai api error %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var openaiResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&openaiResp); err != nil {
+		return nil, fmt.Errorf("decoding openai response: %w", err)
+	}
+
+	var content string
+	if len(openaiResp.Choices) > 0 {
+		content = openaiResp.Choices[0].Message.Content
+	}
+
+	return &GenerateResponse{
+		Model:   req.Model,
+		Content: content,
+		Usage: UsageStats{
+			PromptTokens:     openaiResp.Usage.PromptTokens,
+			CompletionTokens: openaiResp.Usage.CompletionTokens,
+			TotalTokens:      openaiResp.Usage.TotalTokens,
 		},
 	}, nil
 }

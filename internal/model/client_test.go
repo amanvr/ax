@@ -191,6 +191,56 @@ func TestClient_GeminiHTTP(t *testing.T) {
 	}
 }
 
+func TestClient_OpenAIHTTP(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.Header.Get("Authorization") != "Bearer test-api-key" {
+			t.Errorf("expected Bearer Authorization header, got %q", r.Header.Get("Authorization"))
+		}
+		if !strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			t.Errorf("expected /chat/completions path, got %s", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]string{"role": "assistant", "content": "Hello there, friend."}},
+			},
+			"usage": map[string]int{
+				"prompt_tokens":     10,
+				"completion_tokens": 20,
+				"total_tokens":      30,
+			},
+		})
+	}))
+	defer ts.Close()
+
+	client := model.NewClient(
+		model.Config{
+			Provider: "openai",
+			Model:    "gpt-5-nano",
+			BaseURL:  ts.URL + "/v1",
+			APIKey:   "test-api-key",
+		},
+		model.WithHTTPClient(ts.Client()),
+	)
+
+	resp, err := client.Generate(context.Background(), &model.GenerateRequest{
+		Prompt: "Say hello",
+	})
+	if err != nil {
+		t.Fatalf("Generate failed: %v", err)
+	}
+	if resp.Content != "Hello there, friend." {
+		t.Errorf("unexpected content: %q", resp.Content)
+	}
+	if resp.Usage.TotalTokens != 30 {
+		t.Errorf("expected 30 total tokens, got %d", resp.Usage.TotalTokens)
+	}
+}
+
 func TestClient_DefaultModelSecretResolution(t *testing.T) {
 	// 1. Resolve via in-cluster Kubernetes API simulation
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
