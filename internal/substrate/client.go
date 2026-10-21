@@ -198,6 +198,31 @@ func (c *Client) EnsureAtespace(ctx context.Context, atespace string) error {
 	return nil
 }
 
+// EnsureAllowAllEgress grants an actor unrestricted egress (HTTP on any port and
+// HTTPS to any host). Substrate is default-deny egress; this removes that
+// containment, so it is a local-development convenience, not a production
+// default. Idempotent: an existing policy is treated as success.
+func (c *Client) EnsureAllowAllEgress(ctx context.Context, atespace, actorName string) error {
+	req := &ateapipb.CreateActorEgressPolicyRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: atespace, Name: actorName},
+		EgressPolicy: &ateapipb.EgressPolicy{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: atespace, Name: "default"},
+			Rules: []*ateapipb.EgressRule{
+				{Http: &ateapipb.HTTPRule{Hostnames: []string{"*"}, Ports: &ateapipb.Ports{All: &ateapipb.AllPorts{}}}},
+				{Https: &ateapipb.HTTPSRule{Hostnames: []string{"*"}}},
+			},
+		},
+	}
+	err := retryOnCodes(ctx, func() error {
+		_, err := c.control.CreateActorEgressPolicy(ctx, req)
+		return err
+	}, codes.Unavailable)
+	if err != nil && status.Code(err) != codes.AlreadyExists {
+		return fmt.Errorf("creating allow-all egress policy for actor %q: %w", actorName, err)
+	}
+	return nil
+}
+
 // GetActorTemplate fetches an ActorTemplate by name.
 func (c *Client) GetActorTemplate(ctx context.Context, atespace, templateName string) (*ateapipb.ActorTemplate, error) {
 	req := &ateapipb.GetActorTemplateRequest{

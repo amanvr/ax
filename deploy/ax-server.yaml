@@ -82,6 +82,10 @@ spec:
               value: "atenet-router.ate-system.svc.cluster.local:80"
             - name: AX_SNAPSHOTS_BUCKET
               value: "gs://ate-snapshots/ate-env/"
+            # Local-dev convenience: grant every task's actor unrestricted egress.
+            # Remove for any real deployment (Substrate is default-deny by design).
+            - name: AX_ALLOW_ALL_EGRESS
+              value: "true"
           ports:
             - containerPort: 8080
               name: http

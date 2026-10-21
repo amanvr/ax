@@ -49,6 +49,10 @@ const (
 	openaiKeyEnv     = "OPENAI_API_KEY"
 	openaiBaseURLEnv = "OPENAI_BASE_URL"
 	openaiModelEnv   = "OPENAI_MODEL"
+	// allowAllEgressEnv, when set on the server, makes the reconciler grant every
+	// task's actor unrestricted egress. Off by default (Substrate is default-deny);
+	// it removes egress containment, so it is a local-development convenience.
+	allowAllEgressEnv = "AX_ALLOW_ALL_EGRESS"
 	// secretLookupTimeout bounds the Kubernetes secret lookup so a slow or
 	// unreachable cluster cannot stall reconciliation.
 	secretLookupTimeout = 2 * time.Second
@@ -215,6 +219,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		r.setNotReady(task, "ActorCreationFailed", err.Error(), now)
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("ensuring actor: %w", err)
+	}
+
+	if os.Getenv(allowAllEgressEnv) != "" {
+		if err := r.client.EnsureAllowAllEgress(ctx, atespace, actorName); err != nil {
+			return task, fmt.Errorf("ensuring allow-all egress: %w", err)
+		}
+		slog.Info("granted allow-all egress for actor", "actor", actorName, "env", allowAllEgressEnv)
 	}
 
 	// 4. Suspend or Resume the Actor
