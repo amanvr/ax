@@ -43,6 +43,13 @@ EOF
 This removes the containment Substrate provides, so use scoped hostnames
 outside local testing.
 
+### Let AX grant it automatically
+
+Set `AX_ALLOW_ALL_EGRESS=true` on `ax-server` and the reconciler creates the
+allow-all policy above for every task's actor at apply time — no per-task
+`kubectl ate` step. Off by default; for local development only, as it disables
+egress containment for all tasks.
+
 ## How it is enforced
 
 All outbound traffic is mediated by the Substrate egress gateway
