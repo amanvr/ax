@@ -44,8 +44,12 @@ const (
 	gitRetryDelay = 2 * time.Second
 
 	bootstrapScriptPath = "/usr/local/bin/antigravity_bootstrap.py"
-	// bootstrapAPIKeyEnv must be set for the Antigravity agent to run.
+	// bootstrapAPIKeyEnv must be set for the Antigravity agent to run against Gemini.
 	bootstrapAPIKeyEnv = "GEMINI_API_KEY"
+	// openaiAPIKeyEnv and openaiBaseURLEnv enable the agent to run against an
+	// OpenAI-compatible endpoint instead of Gemini.
+	openaiAPIKeyEnv  = "OPENAI_API_KEY"
+	openaiBaseURLEnv = "OPENAI_BASE_URL"
 	// bootstrapTimeoutEnv overrides the default bootstrap timeout with a Go duration string.
 	bootstrapTimeoutEnv = "AX_BOOTSTRAP_TIMEOUT"
 	// bootstrapDataDir, under AXDir, is where the agent keeps its own state so
@@ -280,8 +284,10 @@ func runBootstrap(ctx context.Context, goal, targetPath string) bool {
 		slog.Info("Antigravity bootstrap script not installed; skipping", "script", bootstrapScriptPath)
 		return false
 	}
-	if os.Getenv(bootstrapAPIKeyEnv) == "" {
-		slog.Warn("workspace goal set but no API key available; skipping Antigravity bootstrap", "env", bootstrapAPIKeyEnv)
+	hasGemini := os.Getenv(bootstrapAPIKeyEnv) != ""
+	hasOpenAI := os.Getenv(openaiAPIKeyEnv) != "" && os.Getenv(openaiBaseURLEnv) != ""
+	if !hasGemini && !hasOpenAI {
+		slog.Warn("workspace goal set but no model credentials available; skipping Antigravity bootstrap")
 		return false
 	}
 

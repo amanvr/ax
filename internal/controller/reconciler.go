@@ -44,6 +44,11 @@ const (
 	// geminiBaseURLKey is the secret key and container env var that overrides the
 	// Gemini API base URL for the Antigravity agent, for example a gateway endpoint.
 	geminiBaseURLKey = "GOOGLE_GEMINI_BASE_URL"
+	// openaiKeyEnv, openaiBaseURLEnv and openaiModelEnv point the Antigravity agent
+	// and model client at an OpenAI-compatible endpoint instead of Gemini.
+	openaiKeyEnv     = "OPENAI_API_KEY"
+	openaiBaseURLEnv = "OPENAI_BASE_URL"
+	openaiModelEnv   = "OPENAI_MODEL"
 	// secretLookupTimeout bounds the Kubernetes secret lookup so a slow or
 	// unreachable cluster cannot stall reconciliation.
 	secretLookupTimeout = 2 * time.Second
@@ -164,6 +169,12 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 
 	if baseURL := r.lookupGeminiBaseURL(ctx, atespace); baseURL != "" {
 		extraEnv[geminiBaseURLKey] = baseURL
+	}
+
+	for _, key := range []string{openaiKeyEnv, openaiBaseURLEnv, openaiModelEnv} {
+		if v := r.lookupSecretValue(ctx, atespace, key); v != "" {
+			extraEnv[key] = v
+		}
 	}
 
 	// Only launch configuration belongs in the template; status changes
@@ -403,6 +414,25 @@ func (r *TaskReconciler) lookupGeminiBaseURL(ctx context.Context, atespace strin
 	if url := os.Getenv(geminiBaseURLKey); url != "" {
 		slog.Info("resolved GOOGLE_GEMINI_BASE_URL from server environment for actor template")
 		return url
+	}
+	return ""
+}
+
+// lookupSecretValue resolves an arbitrary key for the task container, preferring the
+// Kubernetes secret in the task's atespace and falling back to the server's own
+// environment. It returns "" when neither source has a value.
+func (r *TaskReconciler) lookupSecretValue(ctx context.Context, atespace, key string) string {
+	if r.SecretResolver != nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
+		defer cancel()
+		if v, err := r.SecretResolver(lookupCtx, atespace, geminiSecretName, key); err == nil && v != "" {
+			slog.Info("resolved key from kubernetes secret for actor template", "key", key, "atespace", atespace)
+			return v
+		}
+	}
+	if v := os.Getenv(key); v != "" {
+		slog.Info("resolved key from server environment for actor template", "key", key)
+		return v
 	}
 	return ""
 }

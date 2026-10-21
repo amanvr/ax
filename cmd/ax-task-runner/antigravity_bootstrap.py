@@ -37,6 +37,10 @@ import sys
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 API_KEY_ENV = "GEMINI_API_KEY"
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
+OPENAI_MODEL_ENV = "OPENAI_MODEL"
+DEFAULT_OPENAI_MODEL = "gpt-5-nano-2025-08-07"
 DEFAULT_WORKSPACE = "/workspace"
 
 SYSTEM_INSTRUCTIONS = (
@@ -72,7 +76,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 async def run_bootstrap(goal: str, workspace_dir: str, data_dir: str) -> None:
-    from google.antigravity import Agent, CapabilitiesConfig, LocalAgentConfig
+    from google.antigravity import (
+        Agent,
+        CapabilitiesConfig,
+        LocalAgentConfig,
+        LocalOpenAIAgentConfig,
+    )
     from google.antigravity.hooks import policy
 
     config_kwargs = dict(
@@ -81,7 +90,6 @@ async def run_bootstrap(goal: str, workspace_dir: str, data_dir: str) -> None:
         # Deny file tools outside the workspace; allow everything else (including
         # run_command, which the SDK denies by default). Denies take priority.
         policies=[*policy.workspace_only([workspace_dir]), policy.allow_all()],
-        api_key=os.environ[API_KEY_ENV],
         system_instructions=SYSTEM_INSTRUCTIONS.format(workspace_dir=workspace_dir),
     )
     if data_dir:
@@ -89,7 +97,18 @@ async def run_bootstrap(goal: str, workspace_dir: str, data_dir: str) -> None:
         config_kwargs["save_dir"] = data_dir
         config_kwargs["app_data_dir"] = data_dir
 
-    async with Agent(LocalAgentConfig(**config_kwargs)) as agent:
+    openai_base_url = os.environ.get(OPENAI_BASE_URL_ENV)
+    if openai_base_url and os.environ.get(OPENAI_API_KEY_ENV):
+        # OpenAI-compatible endpoint; the SDK reads the key from OPENAI_API_KEY.
+        config = LocalOpenAIAgentConfig(
+            model=os.environ.get(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL),
+            base_url=openai_base_url,
+            **config_kwargs,
+        )
+    else:
+        config = LocalAgentConfig(api_key=os.environ[API_KEY_ENV], **config_kwargs)
+
+    async with Agent(config) as agent:
         logging.info("Antigravity agent started in %s; dispatching goal prompt", workspace_dir)
         prompt = (
             f"Set up the workspace directory {workspace_dir} (your current working directory) "
@@ -108,8 +127,15 @@ def main(argv: list[str]) -> int:
     if not args.goal:
         logging.info("No goal provided for Antigravity workspace bootstrap; skipping")
         return 0
-    if not os.environ.get(API_KEY_ENV):
-        logging.error("%s is not set; cannot run Antigravity workspace bootstrap", API_KEY_ENV)
+    has_gemini = bool(os.environ.get(API_KEY_ENV))
+    has_openai = bool(os.environ.get(OPENAI_API_KEY_ENV) and os.environ.get(OPENAI_BASE_URL_ENV))
+    if not (has_gemini or has_openai):
+        logging.error(
+            "no model credentials set; need %s, or %s + %s",
+            API_KEY_ENV,
+            OPENAI_API_KEY_ENV,
+            OPENAI_BASE_URL_ENV,
+        )
         return 1
     if not os.path.isdir(workspace_dir):
         logging.error("Workspace directory %s does not exist", workspace_dir)
