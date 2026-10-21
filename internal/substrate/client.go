@@ -329,7 +329,11 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Env:     envList,
 			WakeupProbe: &ateapipb.ContainerWakeupProbe{
 				HttpGet: &ateapipb.HTTPGetAction{
-					Path: "/readyz",
+					// /healthz reports the runner is serving; /readyz additionally
+					// waits for the (possibly minutes-long) maiden-run agent
+					// bootstrap, which would blow the wakeup probe's short timeout.
+					// WorkspaceReady is tracked separately via a /readyz poll.
+					Path: "/healthz",
 					Port: 80,
 				},
 			},

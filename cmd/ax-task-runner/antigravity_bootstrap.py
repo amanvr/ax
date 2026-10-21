@@ -32,7 +32,11 @@ import argparse
 import asyncio
 import logging
 import os
+import socket
+import subprocess
 import sys
+import time
+import urllib.parse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -42,6 +46,11 @@ OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
 OPENAI_MODEL_ENV = "OPENAI_MODEL"
 DEFAULT_OPENAI_MODEL = "gpt-5-nano-2025-08-07"
 DEFAULT_WORKSPACE = "/workspace"
+# OPENAI_PROXY_SCRIPT is the loopback auth-injecting proxy that fronts the OpenAI
+# gateway: the Antigravity OpenAI connection sends no Authorization header, so the
+# agent points at the proxy and the proxy adds the bearer token and re-originates.
+OPENAI_PROXY_SCRIPT = "/usr/local/bin/openai_auth_proxy.py"
+OPENAI_PROXY_PORT = 8787
 
 SYSTEM_INSTRUCTIONS = (
     "You are the AX Antigravity workspace setup agent. Your job is to initialize the "
@@ -97,27 +106,56 @@ async def run_bootstrap(goal: str, workspace_dir: str, data_dir: str) -> None:
         config_kwargs["save_dir"] = data_dir
         config_kwargs["app_data_dir"] = data_dir
 
+    proxy_proc = None
     openai_base_url = os.environ.get(OPENAI_BASE_URL_ENV)
     if openai_base_url and os.environ.get(OPENAI_API_KEY_ENV):
-        # OpenAI-compatible endpoint; the SDK reads the key from OPENAI_API_KEY.
+        # The Antigravity OpenAI connection sends no auth header, so front the
+        # gateway with a loopback proxy that injects the bearer token.
+        agent_base_url, proxy_proc = _start_openai_proxy(openai_base_url)
         config = LocalOpenAIAgentConfig(
             model=os.environ.get(OPENAI_MODEL_ENV, DEFAULT_OPENAI_MODEL),
-            base_url=openai_base_url,
+            base_url=agent_base_url,
             **config_kwargs,
         )
     else:
         config = LocalAgentConfig(api_key=os.environ[API_KEY_ENV], **config_kwargs)
 
-    async with Agent(config) as agent:
-        logging.info("Antigravity agent started in %s; dispatching goal prompt", workspace_dir)
-        prompt = (
-            f"Set up the workspace directory {workspace_dir} (your current working directory) "
-            f"according to the following goal: {goal}"
-        )
-        response = await agent.chat(prompt)
-        reply_text = await response.text()
-        logging.info("Antigravity workspace setup completed with response:")
-        print(reply_text)
+    try:
+        async with Agent(config) as agent:
+            logging.info("Antigravity agent started in %s; dispatching goal prompt", workspace_dir)
+            prompt = (
+                f"Set up the workspace directory {workspace_dir} (your current working directory) "
+                f"according to the following goal: {goal}"
+            )
+            response = await agent.chat(prompt)
+            reply_text = await response.text()
+            logging.info("Antigravity workspace setup completed with response:")
+            print(reply_text)
+    finally:
+        if proxy_proc is not None:
+            proxy_proc.terminate()
+
+
+def _start_openai_proxy(upstream_base_url: str):
+    """Start the loopback auth-injecting proxy and return (agent_base_url, process).
+
+    The agent talks to http://127.0.0.1:<port><path>; the proxy adds the bearer
+    token and forwards to the real gateway (TLS verification disabled, so it also
+    passes through Agent Substrate's egress MITM).
+    """
+    env = dict(os.environ)
+    env["OPENAI_UPSTREAM_BASE_URL"] = upstream_base_url
+    env["OPENAI_PROXY_PORT"] = str(OPENAI_PROXY_PORT)
+    proc = subprocess.Popen(["python3", OPENAI_PROXY_SCRIPT], env=env)
+    for _ in range(50):
+        try:
+            with socket.create_connection(("127.0.0.1", OPENAI_PROXY_PORT), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.2)
+    path = urllib.parse.urlparse(upstream_base_url).path
+    logging.info("OpenAI auth proxy listening on 127.0.0.1:%d", OPENAI_PROXY_PORT)
+    return f"http://127.0.0.1:{OPENAI_PROXY_PORT}{path}", proc
 
 
 def main(argv: list[str]) -> int:
