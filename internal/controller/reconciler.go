@@ -41,6 +41,18 @@ import (
 const (
 	geminiSecretName = "gemini-api-secret"
 	geminiSecretKey  = "GEMINI_API_KEY"
+	// geminiBaseURLKey is the secret key and container env var that overrides the
+	// Gemini API base URL for the Antigravity agent, for example a gateway endpoint.
+	geminiBaseURLKey = "GOOGLE_GEMINI_BASE_URL"
+	// openaiKeyEnv, openaiBaseURLEnv and openaiModelEnv point the Antigravity agent
+	// and model client at an OpenAI-compatible endpoint instead of Gemini.
+	openaiKeyEnv     = "OPENAI_API_KEY"
+	openaiBaseURLEnv = "OPENAI_BASE_URL"
+	openaiModelEnv   = "OPENAI_MODEL"
+	// allowAllEgressEnv, when set on the server, makes the reconciler grant every
+	// task's actor unrestricted egress. Off by default (Substrate is default-deny);
+	// it removes egress containment, so it is a local-development convenience.
+	allowAllEgressEnv = "AX_ALLOW_ALL_EGRESS"
 	// secretLookupTimeout bounds the Kubernetes secret lookup so a slow or
 	// unreachable cluster cannot stall reconciliation.
 	secretLookupTimeout = 2 * time.Second
@@ -159,6 +171,16 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		extraEnv[geminiSecretKey] = geminiKey
 	}
 
+	if baseURL := r.lookupGeminiBaseURL(ctx, atespace); baseURL != "" {
+		extraEnv[geminiBaseURLKey] = baseURL
+	}
+
+	for _, key := range []string{openaiKeyEnv, openaiBaseURLEnv, openaiModelEnv} {
+		if v := r.lookupSecretValue(ctx, atespace, key); v != "" {
+			extraEnv[key] = v
+		}
+	}
+
 	// Only launch configuration belongs in the template; status changes
 	// must not create new golden snapshots.
 	launchTask := proto.Clone(task).(*v1alpha1.Task)
@@ -217,6 +239,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 		return task, fmt.Errorf("ensuring actor: %w", err)
 	}
 
+	if os.Getenv(allowAllEgressEnv) != "" {
+		if err := r.client.EnsureAllowAllEgress(ctx, atespace, actorName); err != nil {
+			return task, fmt.Errorf("ensuring allow-all egress: %w", err)
+		}
+		slog.Info("granted allow-all egress for actor", "actor", actorName, "env", allowAllEgressEnv)
+	}
+
 	// 4. Suspend or Resume the Actor
 	// Tasks are suspended by default upon creation until explicitly resumed to "Running".
 	if task.Status.Phase == "Suspended" || task.Status.Phase == "" {
@@ -248,60 +277,26 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	task.Status.WorkerIp = workerIP
 	task.Status.Phase = "Running"
 
-	// Check if workspace setup inside the actor has completed
-	host := workerIP
-	port := "80"
-	if h, p, err := net.SplitHostPort(workerIP); err == nil {
-		host = h
-		port = p
-	}
-	readyURL := fmt.Sprintf("http://%s/readyz?check=workspace", net.JoinHostPort(host, port))
 	// Workspace setup happens once per task. After it has completed, WorkspaceReady stays
 	// True across suspend/resume cycles, so only poll while it is still initializing.
 	workspaceReady := r.conditionTrue(task, condWorkspaceReady)
 	if workerIP != "" && !workspaceReady {
-		// Poll briefly for workspace setup completion
+		// Poll briefly for workspace setup completion. A slow maiden-run agent can
+		// outlast this window; the server keeps polling in the background and flips
+		// WorkspaceReady when it finishes.
 		pollCtx, cancel := context.WithTimeout(ctx, r.WorkspaceReadyTimeout)
 		defer cancel()
 
 		ticker := time.NewTicker(workspaceReadyPollInterval)
 		defer ticker.Stop()
 
-		checkReady := func() bool {
-			// 1. Direct readyz check
-			req, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, readyURL, nil)
-			if resp, err := r.httpClient.Do(req); err == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					return true
-				}
-			}
-
-			// 2. Router-based readyz check (in-cluster via atenet-router)
-			if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
-				rReq, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr), nil)
-				if rReq != nil {
-					rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
-					if resp, err := r.httpClient.Do(rReq); err == nil {
-						_ = resp.Body.Close()
-						if resp.StatusCode == http.StatusOK {
-							return true
-						}
-					}
-				}
-			}
-			return false
-		}
-
-		// Initial check
-		workspaceReady = checkReady()
-
+		workspaceReady = r.WorkspaceReadyCheck(pollCtx, atespace, actorName, workerIP)
 		for !workspaceReady {
 			select {
 			case <-pollCtx.Done():
 				goto DonePolling
 			case <-ticker.C:
-				if checkReady() {
+				if r.WorkspaceReadyCheck(pollCtx, atespace, actorName, workerIP) {
 					workspaceReady = true
 					goto DonePolling
 				}
@@ -319,6 +314,13 @@ DonePolling:
 	} else {
 		r.setCondition(task, condWorkspaceReady, "False", "Initializing", fmt.Sprintf("Workspace is initializing at %s", workerIP), time.Now())
 		r.setCondition(task, condReady, "False", "WorkspaceInitializing", "Waiting for workspace setup to complete", time.Now())
+	}
+
+	// A task with no command has no long-running process: once its workspace (and any
+	// maiden-run agent goal) is ready, there is nothing left to run, so report it
+	// Completed rather than leaving it Running forever.
+	if workspaceReady && len(task.GetSpec().GetCommand()) == 0 {
+		task.Status.Phase = "Completed"
 	}
 
 	slog.Info("task successfully reconciled and running",
@@ -380,6 +382,51 @@ func (r *TaskReconciler) setCondition(task *v1alpha1.Task, condType, status, rea
 	})
 }
 
+// WorkspaceReadyCheck reports whether the actor's workspace /readyz endpoint answers
+// 200, trying the actor directly and then via the atenet-router. It is a single
+// check; callers poll it.
+func (r *TaskReconciler) WorkspaceReadyCheck(ctx context.Context, atespace, actorName, workerIP string) bool {
+	if workerIP != "" {
+		host := workerIP
+		port := "80"
+		if h, p, err := net.SplitHostPort(workerIP); err == nil {
+			host, port = h, p
+		}
+		readyURL := fmt.Sprintf("http://%s/readyz?check=workspace", net.JoinHostPort(host, port))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
+		if req != nil {
+			if resp, err := r.httpClient.Do(req); err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return true
+				}
+			}
+		}
+	}
+
+	if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
+		rReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr), nil)
+		if rReq != nil {
+			rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
+			if resp, err := r.httpClient.Do(rReq); err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// MarkWorkspaceReady sets the task's WorkspaceReady and Ready conditions to True.
+// Used by the server's background poller once a slow maiden-run workspace finishes.
+func (r *TaskReconciler) MarkWorkspaceReady(task *v1alpha1.Task) {
+	now := time.Now()
+	r.setCondition(task, condWorkspaceReady, "True", "SetupComplete", "Workspace setup completed", now)
+	r.setCondition(task, condReady, "True", "TaskRunning", "Task is running and its workspace is ready", now)
+}
+
 // lookupGeminiKey resolves the Gemini API key for the task container, preferring the
 // Kubernetes secret in the task's atespace and falling back to the server's own
 // environment. It returns "" when neither source has a value.
@@ -395,6 +442,44 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 	if key := os.Getenv(geminiSecretKey); key != "" {
 		slog.Info("resolved GEMINI_API_KEY from server environment for actor template")
 		return key
+	}
+	return ""
+}
+
+// lookupGeminiBaseURL resolves the Gemini API base URL override for the task container,
+// preferring the Kubernetes secret in the task's atespace and falling back to the server's
+// own environment. It returns "" when neither source has a value, leaving the default endpoint.
+func (r *TaskReconciler) lookupGeminiBaseURL(ctx context.Context, atespace string) string {
+	if r.SecretResolver != nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
+		defer cancel()
+		if url, err := r.SecretResolver(lookupCtx, atespace, geminiSecretName, geminiBaseURLKey); err == nil && url != "" {
+			slog.Info("resolved GOOGLE_GEMINI_BASE_URL from kubernetes secret for actor template", "atespace", atespace)
+			return url
+		}
+	}
+	if url := os.Getenv(geminiBaseURLKey); url != "" {
+		slog.Info("resolved GOOGLE_GEMINI_BASE_URL from server environment for actor template")
+		return url
+	}
+	return ""
+}
+
+// lookupSecretValue resolves an arbitrary key for the task container, preferring the
+// Kubernetes secret in the task's atespace and falling back to the server's own
+// environment. It returns "" when neither source has a value.
+func (r *TaskReconciler) lookupSecretValue(ctx context.Context, atespace, key string) string {
+	if r.SecretResolver != nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
+		defer cancel()
+		if v, err := r.SecretResolver(lookupCtx, atespace, geminiSecretName, key); err == nil && v != "" {
+			slog.Info("resolved key from kubernetes secret for actor template", "key", key, "atespace", atespace)
+			return v
+		}
+	}
+	if v := os.Getenv(key); v != "" {
+		slog.Info("resolved key from server environment for actor template", "key", key)
+		return v
 	}
 	return ""
 }

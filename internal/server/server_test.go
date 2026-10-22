@@ -348,6 +348,12 @@ func (f *fakeReconciler) ReconcileDelete(ctx context.Context, atespace, taskName
 	return f.deleteErr
 }
 
+func (f *fakeReconciler) WorkspaceReadyCheck(ctx context.Context, atespace, actorName, workerIP string) bool {
+	return false
+}
+
+func (f *fakeReconciler) MarkWorkspaceReady(task *v1alpha1.Task) {}
+
 func TestServer_DirectReconcilerLifecycle(t *testing.T) {
 	rec := &fakeReconciler{}
 	srv := server.NewServer(memory.NewStore(), server.Options{Reconciler: rec})
