@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strconv"
@@ -77,6 +78,14 @@ func main() {
 		return
 	case "tunnel":
 		if err := runTunnel(cleanArgs); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	case "logs":
+		// Agent/guest output is collected by Agent Substrate, so logs are served by
+		// its CLI; wrap it so `ax logs` works like the other commands.
+		if err := runLogs(atespace, kubeContext, cleanArgs); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -210,6 +219,7 @@ Available Commands:
   describe workspace <name> Show detailed information about a workspace
   describe model <name>   Show detailed information about a model
   watch task <name>       Stream live status and condition updates for a task
+  logs <task-name> [-f]   Stream a task's agent/guest logs (-f to follow)
   ssh <task-name> [-- cmd] Run a command or shell inside the running task container
                           (Ctrl-C is forwarded; press it twice quickly, or Ctrl-\, to exit locally)
   suspend task <name>     Suspend execution of a task and checkpoint state
@@ -765,6 +775,52 @@ func runWatch(serverURL, atespace string, args []string) error {
 				break
 			}
 		}
+	}
+	return nil
+}
+
+// runLogs streams a task's agent/guest logs by delegating to `kubectl ate logs
+// actors`. Agent Substrate (not the AX control plane) collects guest stdout, so
+// this wraps its CLI to make `ax logs` behave like the other commands.
+func runLogs(atespace, kubeContext string, args []string) error {
+	var name, container string
+	follow := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-f", "--follow":
+			follow = true
+		case "-c", "--container":
+			if i+1 < len(args) {
+				container = args[i+1]
+				i++
+			}
+		default:
+			if name == "" && !strings.HasPrefix(args[i], "-") {
+				name = args[i]
+			}
+		}
+	}
+	if name == "" {
+		return fmt.Errorf("usage: ax logs <task-name> [-f] [-c <container>]")
+	}
+
+	kargs := []string{"ate", "logs", "actors", name, "-a", atespace}
+	if follow {
+		kargs = append(kargs, "-f")
+	}
+	if container != "" {
+		kargs = append(kargs, "-c", container)
+	}
+	if kubeContext != "" {
+		kargs = append(kargs, "--context", kubeContext)
+	}
+
+	cmd := exec.Command("kubectl", kargs...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("streaming logs via `kubectl ate logs` (is the kubectl-ate plugin installed and on PATH?): %w", err)
 	}
 	return nil
 }
