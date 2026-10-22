@@ -1138,8 +1138,10 @@ func runSSH(serverURL, atespace, kubeContext string, args []string) error {
 		return fmt.Errorf("task %q has no status available", taskName)
 	}
 
-	if task.Status.Phase != "Running" {
-		return fmt.Errorf("task %q is in phase %q (must be Running to ssh)", taskName, task.Status.Phase)
+	// Completed covers a one-shot (no-command) task whose actor is still alive after
+	// its agent finished, so ssh into it to inspect the result.
+	if task.Status.Phase != "Running" && task.Status.Phase != "Completed" {
+		return fmt.Errorf("task %q is in phase %q (must be Running or Completed to ssh)", taskName, task.Status.Phase)
 	}
 
 	if !task.GetSpec().GetDebug() {

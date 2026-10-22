@@ -298,6 +298,13 @@ DonePolling:
 		r.setCondition(task, condReady, "False", "WorkspaceInitializing", "Waiting for workspace setup to complete", time.Now())
 	}
 
+	// A task with no command has no long-running process: once its workspace (and any
+	// maiden-run agent goal) is ready, there is nothing left to run, so report it
+	// Completed rather than leaving it Running forever.
+	if workspaceReady && len(task.GetSpec().GetCommand()) == 0 {
+		task.Status.Phase = "Completed"
+	}
+
 	slog.Info("task successfully reconciled and running",
 		"name", task.Metadata.Name,
 		"actor", actorName,

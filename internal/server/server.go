@@ -425,6 +425,12 @@ func (s *Server) awaitWorkspaceReady(atespace, name, workerIP string) {
 				return
 			}
 			s.reconciler.MarkWorkspaceReady(task)
+			// A no-command task is one-shot: once the maiden-run agent finishes there is
+			// nothing left to run, so report it Completed (a terminal phase) rather than
+			// leaving it Running forever.
+			if len(task.GetSpec().GetCommand()) == 0 {
+				task.Status.Phase = "Completed"
+			}
 			if err := s.store.UpdateTaskStatus(ctx, atespace, name, task.Status); err != nil {
 				slog.Warn("failed to persist WorkspaceReady", "atespace", atespace, "task", name, "error", err)
 			} else {
