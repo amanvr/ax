@@ -259,60 +259,26 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, wor
 	task.Status.WorkerIp = workerIP
 	task.Status.Phase = "Running"
 
-	// Check if workspace setup inside the actor has completed
-	host := workerIP
-	port := "80"
-	if h, p, err := net.SplitHostPort(workerIP); err == nil {
-		host = h
-		port = p
-	}
-	readyURL := fmt.Sprintf("http://%s/readyz?check=workspace", net.JoinHostPort(host, port))
 	// Workspace setup happens once per task. After it has completed, WorkspaceReady stays
 	// True across suspend/resume cycles, so only poll while it is still initializing.
 	workspaceReady := r.conditionTrue(task, condWorkspaceReady)
 	if workerIP != "" && !workspaceReady {
-		// Poll briefly for workspace setup completion
+		// Poll briefly for workspace setup completion. A slow maiden-run agent can
+		// outlast this window; the server keeps polling in the background and flips
+		// WorkspaceReady when it finishes.
 		pollCtx, cancel := context.WithTimeout(ctx, r.WorkspaceReadyTimeout)
 		defer cancel()
 
 		ticker := time.NewTicker(workspaceReadyPollInterval)
 		defer ticker.Stop()
 
-		checkReady := func() bool {
-			// 1. Direct readyz check
-			req, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, readyURL, nil)
-			if resp, err := r.httpClient.Do(req); err == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					return true
-				}
-			}
-
-			// 2. Router-based readyz check (in-cluster via atenet-router)
-			if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
-				rReq, _ := http.NewRequestWithContext(pollCtx, http.MethodGet, fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr), nil)
-				if rReq != nil {
-					rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
-					if resp, err := r.httpClient.Do(rReq); err == nil {
-						_ = resp.Body.Close()
-						if resp.StatusCode == http.StatusOK {
-							return true
-						}
-					}
-				}
-			}
-			return false
-		}
-
-		// Initial check
-		workspaceReady = checkReady()
-
+		workspaceReady = r.WorkspaceReadyCheck(pollCtx, atespace, actorName, workerIP)
 		for !workspaceReady {
 			select {
 			case <-pollCtx.Done():
 				goto DonePolling
 			case <-ticker.C:
-				if checkReady() {
+				if r.WorkspaceReadyCheck(pollCtx, atespace, actorName, workerIP) {
 					workspaceReady = true
 					goto DonePolling
 				}
@@ -389,6 +355,51 @@ func (r *TaskReconciler) setCondition(task *v1alpha1.Task, condType, status, rea
 		Message:    message,
 		UpdateTime: ts,
 	})
+}
+
+// WorkspaceReadyCheck reports whether the actor's workspace /readyz endpoint answers
+// 200, trying the actor directly and then via the atenet-router. It is a single
+// check; callers poll it.
+func (r *TaskReconciler) WorkspaceReadyCheck(ctx context.Context, atespace, actorName, workerIP string) bool {
+	if workerIP != "" {
+		host := workerIP
+		port := "80"
+		if h, p, err := net.SplitHostPort(workerIP); err == nil {
+			host, port = h, p
+		}
+		readyURL := fmt.Sprintf("http://%s/readyz?check=workspace", net.JoinHostPort(host, port))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, readyURL, nil)
+		if req != nil {
+			if resp, err := r.httpClient.Do(req); err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return true
+				}
+			}
+		}
+	}
+
+	if routerAddr := os.Getenv("ATENET_ROUTER_ADDR"); routerAddr != "" {
+		rReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s/readyz?check=workspace", routerAddr), nil)
+		if rReq != nil {
+			rReq.Header.Set("ate-target-actor", fmt.Sprintf("%s/%s", atespace, actorName))
+			if resp, err := r.httpClient.Do(rReq); err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// MarkWorkspaceReady sets the task's WorkspaceReady and Ready conditions to True.
+// Used by the server's background poller once a slow maiden-run workspace finishes.
+func (r *TaskReconciler) MarkWorkspaceReady(task *v1alpha1.Task) {
+	now := time.Now()
+	r.setCondition(task, condWorkspaceReady, "True", "SetupComplete", "Workspace setup completed", now)
+	r.setCondition(task, condReady, "True", "TaskRunning", "Task is running and its workspace is ready", now)
 }
 
 // lookupGeminiKey resolves the Gemini API key for the task container, preferring the

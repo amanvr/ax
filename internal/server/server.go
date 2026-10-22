@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/store"
@@ -36,6 +37,8 @@ import (
 type Reconciler interface {
 	Reconcile(ctx context.Context, task *v1alpha1.Task, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error)
 	ReconcileDelete(ctx context.Context, atespace, taskName string) error
+	WorkspaceReadyCheck(ctx context.Context, atespace, actorName, workerIP string) bool
+	MarkWorkspaceReady(task *v1alpha1.Task)
 }
 
 // Options configures the AX API Server.
@@ -371,6 +374,13 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 		if err := s.store.UpdateTaskStatus(ctx, atespace, taskName, task.Status); err != nil {
 			return nil, status.Errorf(codes.Internal, "updating task status: %v", err)
 		}
+		// A slow maiden-run agent can outlast the reconcile's brief readyz poll, leaving
+		// WorkspaceReady False. Keep polling in the background and flip it once the agent
+		// finishes; persisting it also emits a WatchTask event.
+		if task.Status != nil && task.Status.Phase == "Running" && task.Status.WorkerIp != "" &&
+			!conditionIsTrue(task.Status, "WorkspaceReady") {
+			go s.awaitWorkspaceReady(atespace, taskName, task.Status.WorkerIp)
+		}
 	} else {
 		if err := s.store.SaveTask(ctx, task); err != nil {
 			return nil, status.Errorf(codes.Internal, "resuming task: %v", err)
@@ -378,6 +388,65 @@ func (s *Server) ResumeTask(ctx context.Context, req *v1alpha1.ResumeTaskRequest
 	}
 
 	return task, nil
+}
+
+// workspaceReadyWatchTimeout bounds how long the background poller waits for a slow
+// maiden-run workspace to finish before giving up.
+const workspaceReadyWatchTimeout = 15 * time.Minute
+
+// awaitWorkspaceReady polls the actor's workspace readiness after resume and, once
+// ready, flips the task's WorkspaceReady condition to True and persists it. This runs
+// in the background so a long maiden-run agent does not block the resume RPC.
+func (s *Server) awaitWorkspaceReady(atespace, name, workerIP string) {
+	ctx, cancel := context.WithTimeout(context.Background(), workspaceReadyWatchTimeout)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkCtx, cancelCheck := context.WithTimeout(ctx, 3*time.Second)
+			ready := s.reconciler.WorkspaceReadyCheck(checkCtx, atespace, name, workerIP)
+			cancelCheck()
+			if !ready {
+				continue
+			}
+			unlock, err := s.locker.Lock(ctx, "task", atespace, name)
+			if err != nil {
+				return
+			}
+			task, err := s.store.GetTask(ctx, atespace, name)
+			if err != nil || task.Status == nil || task.Status.Phase != "Running" ||
+				conditionIsTrue(task.Status, "WorkspaceReady") {
+				unlock()
+				return
+			}
+			s.reconciler.MarkWorkspaceReady(task)
+			if err := s.store.UpdateTaskStatus(ctx, atespace, name, task.Status); err != nil {
+				slog.Warn("failed to persist WorkspaceReady", "atespace", atespace, "task", name, "error", err)
+			} else {
+				slog.Info("workspace became ready after maiden run", "atespace", atespace, "task", name)
+			}
+			unlock()
+			return
+		}
+	}
+}
+
+// conditionIsTrue reports whether the named status condition is present and True.
+func conditionIsTrue(status *v1alpha1.TaskStatus, condType string) bool {
+	if status == nil {
+		return false
+	}
+	for _, c := range status.Conditions {
+		if c.GetType() == condType {
+			return c.GetStatus() == "True"
+		}
+	}
+	return false
 }
 
 func (s *Server) fetchWorkspaces(ctx context.Context, atespace string, task *v1alpha1.Task) []*v1alpha1.Workspace {
