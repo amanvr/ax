@@ -434,7 +434,6 @@ func runGet(serverURL, atespace string, args []string) error {
 		return yaml.NewEncoder(os.Stdout).Encode(task)
 	}
 
-
 	if (resource == "workspaces" || resource == "workspace") && len(args) == 1 {
 		resp, err := client.ListWorkspaces(ctx, &v1alpha1.ListWorkspacesRequest{Atespace: atespace})
 		if err != nil {
@@ -641,7 +640,6 @@ func runDescribe(serverURL, atespace string, args []string) error {
 		return nil
 	}
 
-
 	task, err := client.GetTask(ctx, &v1alpha1.GetTaskRequest{Atespace: atespace, Name: name})
 	if err != nil {
 		return fmt.Errorf("getting task %q: %w", name, err)
@@ -721,6 +719,9 @@ func runWatch(serverURL, atespace string, args []string) error {
 
 	fmt.Printf("Watching task %s/%s...\n", atespace, name)
 
+	// Track condition statuses so we can report transitions (e.g. WorkspaceReady
+	// False -> True), which carry progress the phase alone does not.
+	prevConds := map[string]string{}
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
@@ -746,6 +747,19 @@ func runWatch(serverURL, atespace string, args []string) error {
 				actor,
 				workerIP,
 			)
+			if task.Status != nil {
+				for _, c := range task.Status.GetConditions() {
+					if prevConds[c.GetType()] == c.GetStatus() {
+						continue
+					}
+					prevConds[c.GetType()] = c.GetStatus()
+					detail := c.GetReason()
+					if c.GetMessage() != "" {
+						detail = fmt.Sprintf("%s: %s", c.GetReason(), c.GetMessage())
+					}
+					fmt.Printf("           ↳ %s: %s (%s)\n", c.GetType(), c.GetStatus(), detail)
+				}
+			}
 			if phase == "Completed" || phase == "Failed" {
 				fmt.Printf("Task reached terminal phase %q.\n", phase)
 				break
